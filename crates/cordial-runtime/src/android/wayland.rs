@@ -3951,13 +3951,14 @@ static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
 /// canvas centre while it is held. Set from `sync_pointer_lock`, read when the
 /// compositor confirms the lock and when it is released.
 ///
-/// **KWin only, because it is the one compositor where it was measured.** The
-/// PR that added it showed, on Plasma, that leaving shift lock puts the cursor
-/// back at the canvas centre when the stored position is recentred while the
-/// lock is held and the hint is committed on release. Nobody has run shift lock
-/// or first person with it on Mutter, sway or Hyprland, so they keep the
-/// behaviour they had: the flag is never set there, and [`engine_owns_lock`] is
-/// where that is decided and tested.
+/// **Set only where the toplevel is the constrained surface.** The PR that
+/// added it showed, on Plasma, that leaving shift lock puts the cursor back at
+/// the canvas centre when the stored position is recentred while the lock is
+/// held and the hint is committed on release. That is now KWin and Hyprland
+/// (see [`constrain_toplevel`]). The recentre-on-release is `INFERRED` on
+/// Hyprland, because the run that settled the lock did not single that half
+/// out. On Mutter and sway the subsurface is constrained and the flag is never
+/// set, which is where [`engine_owns_lock`] is decided and tested.
 static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// Whether this tick's lock is the engine's to recentre. `toplevel_lock` is
@@ -4116,7 +4117,18 @@ unsafe extern "C" fn relative_pointer_motion(
     // uses and is checked for the identical reason: nothing else here says
     // whether the movement belongs to Cordial's canvas or another window
     // entirely.
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    //
+    // **A confirmed lock skips that test, and it must.** `POINTER_ON_CANVAS` is
+    // set from Cordial's *own* secondary `wl_pointer`, while the constraint is
+    // requested against GDK's. When the constraint is on the toplevel — what
+    // Hyprland needs, see `constrain_toplevel` — the compositor can hold the
+    // lock without the canvas subsurface keeping the pointer focus this side
+    // records, and gating on it dropped every relative sample: the lock was
+    // confirmed and the camera never moved, which is issue #56's `toplevel`
+    // result. Relative motion is only emitted while a constraint is active, so
+    // `POINTER_LOCK_ACTIVE` is the stronger and correct gate. The dialog check
+    // below still applies.
+    if !POINTER_ON_CANVAS.load(Ordering::Acquire) && !POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
         return;
     }
     let Some(w) = current() else { return };
@@ -4609,15 +4621,27 @@ impl WaylandWindow {
 
 /// Whether to constrain the GTK toplevel rather than the engine's subsurface.
 ///
-/// KWin only. KDE bug 463088 is why the toplevel is constrained at all, and the
-/// canvas being cut out of the toplevel's input region is why that was not
-/// enough -- see `lock_pointer`. On every other compositor the subsurface is the
-/// surface that actually holds pointer focus over the canvas, and constraining
-/// anything else is a lock that is granted and never activates.
+/// **Two compositors need this, for opposite reasons.** KWin activates a lock
+/// on a constrained subsurface and then still lets the physical cursor leave it
+/// (KDE bug 463088), which is why the toplevel is constrained there at all --
+/// and the canvas being cut out of the toplevel's input region is why the
+/// constraint alone was not enough; see `lock_pointer`. Hyprland is here
+/// because it never answers `locked` for a constraint on a subsurface: the
+/// engine's canvas is a `wl_subsurface` (ADR-011) and Hyprland's
+/// pointer-constraints path is toplevel-first, the same gap Godot hit and the
+/// one `hyprwm/Hyprland#16311` exists to close. On the compositors that are
+/// neither, the subsurface is the surface that actually holds pointer focus
+/// over the canvas, and constraining anything else is a lock that is granted
+/// and never activates.
 ///
 /// This is also the gate for everything the toplevel lock needed beyond the
 /// constraint itself: the canvas in the input region, recentring the engine's
 /// pointer while it holds the lock, and the hint commit on release.
+///
+/// Observed on Hyprland 0.56.2 by the reporter of #56: with the constraint on
+/// the toplevel the lock confirms and shift lock holds the cursor in the
+/// window, where before it walked out. The reasoning above came first and is
+/// left as it was written; the run is what settled it.
 fn constrain_toplevel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -4628,8 +4652,10 @@ fn constrain_toplevel() -> bool {
         }
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase();
         let session = std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_ascii_lowercase();
-        desktop.contains("kde") || desktop.contains("plasma")
-            || session.contains("kde") || session.contains("plasma")
+        let kde = desktop.contains("kde") || desktop.contains("plasma")
+            || session.contains("kde") || session.contains("plasma");
+        let hyprland = desktop.contains("hyprland") || session.contains("hyprland");
+        kde || hyprland
     })
 }
 
@@ -4671,7 +4697,8 @@ fn constrain_toplevel() -> bool {
         // event pointer can be acknowledged as locked while the real cursor,
         // which GDK owns, stays free -- and it applies everywhere. Constraining
         // the **toplevel** is the half that is a KWin bug workaround, and it is
-        // now gated to KWin instead of imposed on every compositor.
+        // now gated to the compositors that need it -- KWin and Hyprland --
+        // instead of imposed on every compositor.
         //
         // `CORDIAL_POINTER_LOCK_SURFACE=toplevel|canvas` overrules the guess,
         // because a compositor list in a binary goes stale and the person
