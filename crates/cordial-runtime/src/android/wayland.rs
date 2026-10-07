@@ -3266,14 +3266,22 @@ impl WaylandWindow {
         super::input::pass_mouse_move(x, y);
     }
 
-    /// Deliver a release for every button this side still thinks is down.
-    ///
-    /// Called when the pointer leaves the canvas, where no real release will
-    /// arrive. Goes through `dispatch_pointer_button` rather than clearing the
-    /// mask directly so the engine sees exactly the events it would have seen
-    /// had the user released on the canvas -- a bitmask cleared behind the
-    /// engine's back leaves the two disagreeing, which is the same bug one
-    /// layer down.
+    /// Release stranded buttons after dispatching the pending Wayland events.
+    /// A canvas leave can be followed by a toplevel lock in the same batch;
+    /// releasing inside that callback cuts off a held fire or aim button.
+    fn reconcile_pointer_buttons(&self) {
+        let owns_pointer = pointer_event_is_the_engines(
+            POINTER_ON_CANVAS.load(Ordering::Acquire),
+            POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+        );
+        if !owns_pointer || dialog_in_front(self) || self.host.0.focused() == Some(false) {
+            self.release_held_buttons();
+        }
+    }
+
+    /// Tell the engine about each release before forgetting the held mask.
+    /// Clearing only our copy leaves the engine firing or dragging after focus
+    /// loss, with no real release left to correct it.
     fn release_held_buttons(&self) {
         let held = self.pointer_buttons.load(Ordering::Relaxed);
         if held == 0 {
@@ -3288,7 +3296,7 @@ impl WaylandWindow {
         ] {
             if held & button != 0 {
                 if super::input::trace_mouse() {
-                    eprintln!("[cordial] pointer left the canvas holding {button}; releasing it");
+                    eprintln!("[cordial] pointer ownership lost holding {button}; releasing it");
                 }
                 self.dispatch_pointer_button(button, false);
             }
@@ -3487,6 +3495,11 @@ fn pointer_event_is_the_engines(on_canvas: bool, lock_active: bool) -> bool {
     on_canvas || lock_active
 }
 
+fn route_pointer_button(owns_pointer: bool, held: i32, button: i32, press: bool) -> bool {
+    let was_down = held & button != 0;
+    if press { owns_pointer && !was_down } else { was_down }
+}
+
 /// Whether a web-view dialog of Cordial's own is in front of the engine.
 ///
 /// **Stacking and input focus are decided separately, and only stacking was
@@ -3591,29 +3604,11 @@ unsafe extern "C" fn pointer_enter(
     w.dispatch_pointer_motion(fixed_to_f32(x), fixed_to_f32(y));
 }
 unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _serial: u32, _surface: *mut c_void) {
-    // **Let go of anything still held, before the canvas flag drops.**
-    //
-    // Wayland sends no button release on leave, and `pointer_button` below
-    // ignores events while the pointer is off the canvas -- so a button held
-    // as the pointer leaves is a bit in `pointer_buttons` that nothing ever
-    // clears. That bit is one of the two things `sync_pointer_lock` locks the
-    // pointer for, and it is gated on being back on the canvas, so the next
-    // time the pointer comes back the drag-lock engages with no button down
-    // and the camera is captured until something happens to clear it.
-    //
-    // Reported as shift lock that "sometimes won't undo ... so you're kinda
-    // stuck with it, then it works": the "then it works" is the next press and
-    // release on the canvas clearing the stale bit. The engine is told too,
-    // not just this side's bitmask, because it received the press and would
-    // otherwise go on believing the button is down -- which is the other half
-    // of a camera that will not let go.
-    //
-    // Synthesising the release is the correct platform behaviour rather than a
-    // workaround: the protocol guarantees no real one is coming, and Android's
-    // own answer to the same situation is ACTION_CANCEL.
-    if let Some(w) = current() {
-        w.release_held_buttons();
-    }
+    // A leave is not necessarily a lost gesture: the toplevel may be taking
+    // focus for a lock. Reconcile held buttons after the event batch, once its
+    // enter/locked/unlocked callbacks have supplied the new ownership state.
+    // INFERRED as the cause of intermittent shooting loss on Hyprland; the
+    // button routing is unit-tested, but this needs an in-experience repeat.
     POINTER_ON_CANVAS.store(false, Ordering::Release);
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
@@ -3637,29 +3632,26 @@ unsafe extern "C" fn pointer_button(
     button: u32,
     state: u32,
 ) {
-    // A confirmed toplevel lock moves pointer focus onto the parent window, so
-    // `POINTER_ON_CANVAS` reads false for the whole time shift lock or first
-    // person holds the cursor. Gating on the canvas alone dropped every click
-    // before it reached `nativePassMouseButton`, which is the "I can't click
-    // with shift lock on" report; see `pointer_event_is_the_engines`.
-    if !pointer_event_is_the_engines(
+    let Some(w) = current() else { return };
+    let Some(android_button) = linux_button_to_android(button) else { return };
+    let owns_pointer = pointer_event_is_the_engines(
         POINTER_ON_CANVAS.load(Ordering::Acquire),
         POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) && !dialog_in_front(&w);
+    // A release belongs to whoever received its press, even if the lock or
+    // focus changed meanwhile. Conversely, a release for GTK's press is not
+    // an engine event, and a duplicate press must not restart a held gesture.
+    if !route_pointer_button(
+        owns_pointer,
+        w.pointer_buttons.load(Ordering::Relaxed),
+        android_button,
+        state == 1,
     ) {
-        return;
-    }
-    let Some(w) = current() else { return };
-    if dialog_in_front(&w) {
-        // Said once per press rather than per motion event, which would be a
-        // line per frame while the pointer moves over the dialog.
-        if super::input::trace_mouse() {
-            eprintln!(
-                "[cordial] click withheld from the engine: a web-view dialog is in front"
-            );
+        if state == 1 && dialog_in_front(&w) && super::input::trace_mouse() {
+            eprintln!("[cordial] click withheld from the engine: a web-view dialog is in front");
         }
         return;
     }
-    let Some(android_button) = linux_button_to_android(button) else { return };
     w.dispatch_pointer_button(android_button, state == 1);
 }
 /// The scroll wheel. Filtered by surface like every other pointer event: the
@@ -4537,7 +4529,10 @@ impl WaylandWindow {
         const CAMERA_BUTTONS: i32 = super::input::BUTTON_SECONDARY | super::input::BUTTON_TERTIARY;
         let dragging = !no_drag_lock()
             && self.pointer_buttons.load(Ordering::Relaxed) & CAMERA_BUTTONS != 0
-            && POINTER_ON_CANVAS.load(Ordering::Acquire);
+            && pointer_event_is_the_engines(
+                POINTER_ON_CANVAS.load(Ordering::Acquire),
+                POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+            );
         let asked = engine_wants || dragging || force_pointer_lock();
 
         // **A dialog on top of the canvas takes the cursor back, whatever the
@@ -6319,6 +6314,7 @@ impl WaylandWindow {
         self.reconcile_stacking();
         if !engine {
             self.read_display();
+            self.reconcile_pointer_buttons();
             return;
         }
         // Polled rather than driven by an event, because the engine's own
@@ -6329,6 +6325,7 @@ impl WaylandWindow {
         // minute.
         self.sync_pointer_lock();
         self.read_display();
+        self.reconcile_pointer_buttons();
     }
 
     fn read_display(&self) {
@@ -6810,6 +6807,34 @@ mod tests {
         // Off the canvas with no lock is the header bar's click, which is what
         // the flag was added to keep the engine from seeing.
         assert!(!pointer_event_is_the_engines(false, false));
+    }
+
+    #[test]
+    fn a_release_follows_its_press_across_pointer_ownership_changes() {
+        use super::super::input::{BUTTON_PRIMARY, BUTTON_SECONDARY};
+        let mut held = 0;
+        let mut event = |owns, button, press| {
+            let routed = route_pointer_button(owns, held, button, press);
+            if routed {
+                if press { held |= button; } else { held &= !button; }
+            }
+            routed
+        };
+        assert!(event(true, BUTTON_PRIMARY, true));
+        assert!(event(true, BUTTON_SECONDARY, true));
+        // Losing focus between aim/fire and release must finish both presses.
+        assert!(event(false, BUTTON_SECONDARY, false));
+        assert!(event(false, BUTTON_PRIMARY, false));
+        assert!(!event(false, BUTTON_PRIMARY, false));
+        // A titlebar press and its release must both stay with GTK, even if
+        // the pointer reaches the canvas between the two.
+        assert!(!event(false, BUTTON_PRIMARY, true));
+        assert!(!event(true, BUTTON_PRIMARY, false));
+        // A later gesture must still start, once, and end normally.
+        assert!(event(true, BUTTON_PRIMARY, true));
+        assert!(!event(true, BUTTON_PRIMARY, true));
+        assert!(event(true, BUTTON_PRIMARY, false));
+        assert_eq!(held, 0);
     }
 
     #[test]
