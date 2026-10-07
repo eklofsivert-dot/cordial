@@ -3457,6 +3457,36 @@ const WHEEL_AXIS_STEP: f32 = 10.0;
 /// `hide_pointer` fired for it.
 static POINTER_ON_CANVAS: AtomicBool = AtomicBool::new(false);
 
+/// Whether a pointer event delivered on Cordial's own `wl_pointer` is the
+/// engine's to receive.
+///
+/// The canvas subsurface holds pointer focus while the pointer is over it, and
+/// [`POINTER_ON_CANVAS`] records that. But a confirmed lock that constrains the
+/// *toplevel* — KWin and Hyprland, see [`constrain_toplevel`] — moves pointer
+/// focus onto the parent window, so `POINTER_ON_CANVAS` reads false for as long
+/// as shift lock or first person holds the cursor. Gating a handler on the
+/// canvas alone therefore drops events that are plainly the engine's.
+///
+/// **That has now cost three separate features, one per commit.** It dropped
+/// every relative sample, leaving the camera frozen under a lock that had
+/// confirmed (issue #56, fixed in [`relative_pointer_motion`]). The same gate
+/// in [`pointer_button`] then dropped every click — the report was shift lock
+/// "and I can't click" — and in [`pointer_axis`] every scroll notch. A
+/// confirmed lock is the stronger proof of ownership: the cursor has nowhere
+/// else to be, so the event cannot belong to the header bar it cannot reach.
+///
+/// **The click half is measured; the scroll half is `INFERRED`.** Confirmed on
+/// Hyprland 0.56.2 on 2026-10-07: with shift lock engaged, a click that this
+/// gate had been swallowing now reaches the engine and the game acts on it.
+/// Scroll rides the identical gate and is reasoned from that alone, not
+/// separately observed. The readback for a repeat is the `nativePassMouseButton`
+/// line under `CORDIAL_TRACE_MOUSE=1`; the control is
+/// `CORDIAL_POINTER_LOCK_SURFACE=canvas`, where the lock never confirms on
+/// Hyprland and the pre-fix behaviour is what runs.
+fn pointer_event_is_the_engines(on_canvas: bool, lock_active: bool) -> bool {
+    on_canvas || lock_active
+}
+
 /// Whether a web-view dialog of Cordial's own is in front of the engine.
 ///
 /// **Stacking and input focus are decided separately, and only stacking was
@@ -3607,7 +3637,15 @@ unsafe extern "C" fn pointer_button(
     button: u32,
     state: u32,
 ) {
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    // A confirmed toplevel lock moves pointer focus onto the parent window, so
+    // `POINTER_ON_CANVAS` reads false for the whole time shift lock or first
+    // person holds the cursor. Gating on the canvas alone dropped every click
+    // before it reached `nativePassMouseButton`, which is the "I can't click
+    // with shift lock on" report; see `pointer_event_is_the_engines`.
+    if !pointer_event_is_the_engines(
+        POINTER_ON_CANVAS.load(Ordering::Acquire),
+        POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) {
         return;
     }
     let Some(w) = current() else { return };
@@ -3627,7 +3665,13 @@ unsafe extern "C" fn pointer_button(
 /// The scroll wheel. Filtered by surface like every other pointer event: the
 /// header bar is GTK's, and a scroll over it is not the engine's to see.
 unsafe extern "C" fn pointer_axis(_data: *mut c_void, _pointer: *mut c_void, _time: u32, axis: u32, value: i32) {
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    // Same toplevel-lock gap as `pointer_button`: scroll while shift lock or
+    // first person holds the cursor was dropped because the canvas no longer
+    // has pointer focus. See `pointer_event_is_the_engines`.
+    if !pointer_event_is_the_engines(
+        POINTER_ON_CANVAS.load(Ordering::Acquire),
+        POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) {
         return;
     }
     if let Some(w) = current() {
@@ -4128,7 +4172,10 @@ unsafe extern "C" fn relative_pointer_motion(
     // result. Relative motion is only emitted while a constraint is active, so
     // `POINTER_LOCK_ACTIVE` is the stronger and correct gate. The dialog check
     // below still applies.
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) && !POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
+    if !pointer_event_is_the_engines(
+        POINTER_ON_CANVAS.load(Ordering::Acquire),
+        POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+    ) {
         return;
     }
     let Some(w) = current() else { return };
@@ -6748,6 +6795,21 @@ mod tests {
         assert!(!release_commits_parent(true, true));
         assert!(!release_commits_parent(false, false));
         assert!(!release_commits_parent(false, true));
+    }
+
+    #[test]
+    fn a_confirmed_lock_makes_a_pointer_event_the_engines() {
+        // On the canvas is the engine's whether or not a lock is held.
+        assert!(pointer_event_is_the_engines(true, false));
+        assert!(pointer_event_is_the_engines(true, true));
+        // Off the canvas with a lock confirmed is the toplevel-lock case: the
+        // focus moved to the parent window but the cursor is captured, so the
+        // event is still the engine's. This is the one that used to return
+        // false and drop the click.
+        assert!(pointer_event_is_the_engines(false, true));
+        // Off the canvas with no lock is the header bar's click, which is what
+        // the flag was added to keep the engine from seeing.
+        assert!(!pointer_event_is_the_engines(false, false));
     }
 
     #[test]
